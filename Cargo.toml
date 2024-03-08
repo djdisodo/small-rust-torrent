@@ -1,0 +1,30 @@
+[package]
+name = "smolbt"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+portable-atomic = "1.5.1"
+serde_derive = "1.0.192"
+anyhow = { version = "1.0.75", features = ["backtrace"]}
+buffers = "0.0.0"
+itertools = "0.12.0"
+tokio = { default-features = false, version = "1.34.0", features = ["sync", "rt", "fs", "io-util", "macros", "net", "time"] }
+tokio-util = { version = "0.7.10", features = ["io-util", "io"]}
+bitvec = "1.0.1"
+double-map = "0.14.0"
+arraydeque = "0.5.1"
+futures-util = "0.3.29"
+num_enum = "0.7.1"
+log = "0.4.20"
+derive_more = { version = "1.0.0-beta.6", features = ["deref", "deref_mut"] }
+lava_torrent = { path = "../lava_torrent" }
+simplelog = "0.12.1"
+
+sha1_smol = "1.0.0"
+
+[[bin]]
+name = "example"
+path = "src/bin.rs"

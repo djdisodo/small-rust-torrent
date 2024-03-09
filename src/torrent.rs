@@ -1,23 +1,20 @@
 use std::io::Read;
-use std::net::{IpAddr, SocketAddr};
-use std::ops::AddAssign;
+use std::net::{SocketAddr};
 use std::path::PathBuf;
-use anyhow::bail;
-use bitvec::bitbox;
 use bitvec::macros::internal::funty::Fundamental;
 use tokio::sync::RwLock;
-use bitvec::boxed::BitBox;
-use bitvec::order::Msb0;
 use crate::client::Client;
-use crate::peer::{InternalMessage, PeerConnection};
+use crate::peer::{InternalMessage, PeerConnection, PeerConnectionTasks};
 use crate::piece::{PieceFiles};
 use crate::types::*;
 use derive_more::{Deref, DerefMut};
-use itertools::Itertools;
 
 pub use lava_torrent::torrent::v1::Torrent as TorrentFile;
 use tokio::fs::OpenOptions;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpStream;
 use tokio_util::bytes::Buf;
+use crate::handshake::HandShake;
 
 #[derive(Deref, DerefMut)]
 pub struct TorrentHandle {
@@ -38,17 +35,47 @@ impl Drop for TorrentHandle {
 pub struct Torrent {
     pub hash: Hash20,
     pub client: IoRc<Client>,
-    pub connected_peers: Mutex<HashMap<SocketAddr, IoRc<PeerConnection>>>,
+    pub(crate) connected_peers: Mutex<HashMap<SocketAddr, (IoRc<PeerConnection>, PeerConnectionTasks)>>,
     pub piece_size: PieceSize,
     pub last_piece_size: u32, //precalculated
     pub hashes: Vec<Hash20>,
-    pub map: RwLock<BitBox<u8, Msb0>>,
-    pub to_download_map: RwLock<BitBox<u8, Msb0>>,
+    pub(crate) bitfield: RwLock<BitField>,
+    pub(crate) to_download_bitfield: RwLock<BitField>,
     pub files: Vec<(u64, PathBuf, Mutex<fs::File>)>
 }
 
 impl Torrent {
-    pub async fn new_from_file(client: &IoRc<Client>, file: TorrentFile, path: PathBuf) -> anyhow::Result<()> {
+    pub async fn load_status(&self, read: &mut (impl AsyncRead + Unpin)) -> anyhow::Result<usize> {
+        let mut bitfield = self.bitfield.write().await;
+        let mut to_download_bitfield = self.to_download_bitfield.write().await;
+        read.read_exact(bitfield.as_raw_mut_slice()).await?;
+        read.read_exact(to_download_bitfield.as_raw_mut_slice()).await?;
+        Ok(bitfield.as_raw_slice().len() + to_download_bitfield.as_raw_slice().len())
+    }
+
+    pub async fn save_status(&self, write: &mut (impl AsyncWrite + Unpin)) -> anyhow::Result<usize> {
+        let bitfield = self.bitfield.read().await;
+        let to_download_bitfield = self.to_download_bitfield.read().await;
+        write.write_all(bitfield.as_raw_slice()).await?;
+        write.write_all(to_download_bitfield.as_raw_slice()).await?;
+        Ok(bitfield.as_raw_slice().len() + to_download_bitfield.as_raw_slice().len())
+    }
+
+    pub async fn save_files(&self) -> anyhow::Result<()> {
+        let mut open_options = OpenOptions::new();
+        open_options.create(true);
+        open_options.write(true);
+        open_options.read(true);
+        for (_, path, file) in self.files.iter() {
+            let mut file_lock = file.lock().await;
+            file_lock.flush().await?;
+            *file_lock = open_options.open(path).await?;
+            break;
+        }
+        Ok(())
+    }
+
+    pub async fn new_from_file(client: IoRc<Client>, file: TorrentFile, path: PathBuf) -> anyhow::Result<TorrentHandle> {
         let mut buf = [0u8; 20];
         file.info_hash_bytes().reader().read_exact(&mut buf)?;
         let hash = Hash20 {
@@ -86,7 +113,7 @@ impl Torrent {
 
         let torrent = Torrent {
             hash,
-            client: client.clone(),
+            client: client,
             connected_peers: Default::default(),
             piece_size,
             last_piece_size: {
@@ -104,16 +131,13 @@ impl Torrent {
                     v: buf
                 })
             }).collect::<Result<Vec<_>, std::io::Error>>()?,
-            map: RwLock::new(bitbox![u8, Msb0; 0u8; pieces]),
-            to_download_map: RwLock::new(bitbox![u8, Msb0; 0u8; pieces]),
+            bitfield: RwLock::new(BitField::new(pieces)),
+            to_download_bitfield: RwLock::new(BitField::new(pieces)),
             files: files_mapped,
         };
-        let handle = TorrentHandle {
+        Ok(TorrentHandle {
             inner: IoRc::new(torrent),
-        };
-        println!("hash: {hash:#?}");
-        client.torrents.lock().await.insert(hash, handle);
-        Ok(())
+        })
     }
 
     pub fn new_piece(&self, idx: u32) -> Option<PieceFiles> {
@@ -154,14 +178,25 @@ impl Torrent {
     pub async fn have(&self, idx: u32) {
         let peers = self.connected_peers.lock().await;
         for x in peers.iter() {
-            x.1.internal_channel.send(InternalMessage::Have {
+            x.1.0.internal_channel.send(InternalMessage::Have {
                 piece: idx
             }).await.unwrap();
         }
     }
 
-    pub async fn remove_peer(&self, addr: &SocketAddr) {
-        self.connected_peers.lock().await.remove(&addr);
-        self.client.peer_left.lock().await.add_assign(1);
+    pub async fn connect_peer(self: &IoRc<Self>, addr: SocketAddr, sock: TcpStream, incoming: Option<HandShake>) -> anyhow::Result<()> {
+        let con = PeerConnection::connect(addr, self.clone(), sock, incoming).await?;
+        self.connected_peers.lock().await.insert(addr, con);
+        Ok(())
+    }
+
+    pub async fn disconnect_peer(&self, addr: &SocketAddr) {
+        if self.connected_peers.lock().await.remove(&addr).is_some() {
+            self.client.drop_peer().await;
+        }
+    }
+
+    pub async fn peer(&self, addr: &SocketAddr) -> Option<IoRc<PeerConnection>> {
+        self.connected_peers.lock().await.get(&addr).map(|(x, _)| x.clone())
     }
 }

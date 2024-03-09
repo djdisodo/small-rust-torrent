@@ -22,9 +22,15 @@ log = "0.4.20"
 derive_more = { version = "1.0.0-beta.6", features = ["deref", "deref_mut"] }
 lava_torrent = { path = "../lava_torrent" }
 simplelog = "0.12.1"
+external_sha1 = {path = "../external_sha1", optional = true}
+hex = "0.4.3"
 
 sha1_smol = "1.0.0"
+
+[features]
+external_sha1 = ["dep:external_sha1"]
 
 [[bin]]
 name = "example"
 path = "src/bin.rs"
+

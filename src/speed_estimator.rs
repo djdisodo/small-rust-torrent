@@ -26,7 +26,7 @@ impl<T: Add<T, Output=T> + Sub<T, Output=T> + Copy, const COUNT: usize> SpeedEst
         self.queue.push_back((last, Instant::now())).unwrap();
     }
 
-    pub fn speed(&self, adder: T) -> Option<(T, Duration)> {
+    pub fn speed(&self, _adder: T) -> Option<(T, Duration)> {
         let l1 = self.queue.get(0)?;
         let l2 = self.queue.get(COUNT - 1)?;
         Some((l1.0 - l2.0, l1.1 - l2.1))

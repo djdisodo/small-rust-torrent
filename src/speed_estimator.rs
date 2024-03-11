@@ -1,34 +1,56 @@
-use std::ops::{Add, Sub};
 use std::time::{Duration, Instant};
 use arraydeque::ArrayDeque;
 
-#[derive(Debug)]
-pub struct SpeedEstimator<T: Add<T, Output=T> + Sub<T, Output=T> + Copy, const COUNT: usize = 1> {
-    queue: ArrayDeque<(T, Instant), COUNT>
+struct Update {
+    time: Instant,
+    bytes_received: u32,
 }
 
-impl<T: Add<T, Output=T> + Sub<T, Output=T> + Copy + Default, const COUNT: usize> Default for SpeedEstimator<T, COUNT> {
-    fn default() -> Self {
-        let mut queue: ArrayDeque<(T, Instant), COUNT> = ArrayDeque::new();
-        queue.push_back((T::default(), Instant::now())).unwrap();
+#[derive(Default)]
+pub struct SpeedEstimator<const N: usize> {
+    updates: ArrayDeque<Update, N>,
+}
+
+impl<const N: usize> SpeedEstimator<N> {
+    pub fn new() -> Self {
         Self {
-            queue
+            updates: ArrayDeque::new(),
         }
     }
-}
 
-impl<T: Add<T, Output=T> + Sub<T, Output=T> + Copy, const COUNT: usize> SpeedEstimator<T, COUNT> {
-    pub fn update(&mut self, adder: T) {
-        if self.queue.is_full() {
-            self.queue.pop_front();
+    pub fn update(&mut self, n: u32) {
+        let update = Update {
+            time: Instant::now(),
+            bytes_received: n,
+        };
+
+        // Pop before pushing if full
+        if self.updates.is_full() {
+            let _ = self.updates.pop_front();
         }
-        let last = self.queue[0].0 + adder;
-        self.queue.push_back((last, Instant::now())).unwrap();
+
+        self.updates.push_back(update).unwrap();
     }
 
-    pub fn speed(&self, _adder: T) -> Option<(T, Duration)> {
-        let l1 = self.queue.get(0)?;
-        let l2 = self.queue.get(COUNT - 1)?;
-        Some((l1.0 - l2.0, l1.1 - l2.1))
+    pub fn estimated_speed(&self) -> u32 {
+        if self.updates.is_empty() {
+            return 0;
+        }
+
+        let mut total_bytes = 0;
+        let mut total_time = Duration::new(0, 0);
+
+        let now = Instant::now();
+
+        for update in &self.updates {
+            total_bytes += update.bytes_received;
+            total_time += now - update.time;
+        }
+
+        if total_time.as_secs() == 0 {
+            return 0;
+        }
+
+        total_bytes / total_time.as_secs() as u32
     }
 }

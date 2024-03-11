@@ -1,20 +1,34 @@
+use std::cmp::min;
+use std::collections::VecDeque;
 use std::io::Read;
 use std::net::{SocketAddr};
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 use bitvec::macros::internal::funty::Fundamental;
-use tokio::sync::RwLock;
+use tokio::sync::{OwnedSemaphorePermit, RwLock};
 use crate::client::Client;
 use crate::peer::{InternalMessage, PeerConnection, PeerConnectionTasks};
 use crate::piece::{PieceFiles};
 use crate::types::*;
 use derive_more::{Deref, DerefMut};
+use itertools::Itertools;
 
 pub use lava_torrent::torrent::v1::Torrent as TorrentFile;
+use lava_torrent::tracker::TrackerResponse;
+use log::{debug, info};
+use portable_atomic::AtomicU64;
+use rand::seq::SliceRandom;
+use rand::thread_rng;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+use tokio::select;
+use tokio::time::Instant;
 use tokio_util::bytes::Buf;
 use crate::handshake::HandShake;
+use crate::speed_estimator::SpeedEstimator;
+use crate::tracker::http_tracker;
 
 #[derive(Deref, DerefMut)]
 pub struct TorrentHandle {
@@ -41,7 +55,11 @@ pub struct Torrent {
     pub hashes: Vec<Hash20>,
     pub(crate) bitfield: RwLock<BitField>,
     pub(crate) to_download_bitfield: RwLock<BitField>,
-    pub files: Vec<(u64, PathBuf, Mutex<fs::File>)>
+    pub files: Vec<(u64, PathBuf, Mutex<fs::File>)>,
+    pub trackers: Mutex<Vec<Vec<(String, Instant)>>>,
+    pub peers: Mutex<VecDeque<SocketAddr>>,
+    pub uploaded: AtomicU64,
+    pub(crate) down_speed: Mutex<SpeedEstimator<10>>,
 }
 
 impl Torrent {
@@ -73,6 +91,10 @@ impl Torrent {
             break;
         }
         Ok(())
+    }
+
+    pub async fn dspeed(&self) -> u32 {
+        self.down_speed.lock().await.estimated_speed()
     }
 
     pub async fn new_from_file(client: IoRc<Client>, file: TorrentFile, path: PathBuf) -> anyhow::Result<TorrentHandle> {
@@ -109,11 +131,24 @@ impl Torrent {
         let piece_size = file.piece_length.as_u32();
         let pieces = file.pieces.len();
 
+        let mut trackers;
+        if let Some(announce) = file.announce_list {
+            let now = Instant::now();
+            trackers = announce.into_iter().map(|x| {
+                let mut tier = x.into_iter().map(|x| (x, now)).collect_vec();
+                tier.shuffle(&mut thread_rng());
+                tier
+            }).collect_vec();
+        } else {
+            trackers = vec![];
+        }
+
+        let peers = Mutex::new(VecDeque::with_capacity(client.config.request_peer_limit));
 
 
         let torrent = Torrent {
             hash,
-            client: client,
+            client,
             connected_peers: Default::default(),
             piece_size,
             last_piece_size: {
@@ -134,6 +169,10 @@ impl Torrent {
             bitfield: RwLock::new(BitField::new(pieces)),
             to_download_bitfield: RwLock::new(BitField::new(pieces)),
             files: files_mapped,
+            trackers: Mutex::new(trackers),
+            peers,
+            uploaded: Default::default(),
+            down_speed: Default::default(),
         };
         Ok(TorrentHandle {
             inner: IoRc::new(torrent),
@@ -184,19 +223,130 @@ impl Torrent {
         }
     }
 
-    pub async fn connect_peer(self: &IoRc<Self>, addr: SocketAddr, sock: TcpStream, incoming: Option<HandShake>) -> anyhow::Result<()> {
-        let con = PeerConnection::connect(addr, self.clone(), sock, incoming).await?;
+    pub async fn connect_peer(self: &IoRc<Self>, addr: SocketAddr, sock: TcpStream, incoming: Option<HandShake>, perm: OwnedSemaphorePermit) -> anyhow::Result<()> {
+        let con = PeerConnection::connect(addr, self.clone(), sock, incoming, perm).await?;
         self.connected_peers.lock().await.insert(addr, con);
         Ok(())
     }
 
     pub async fn disconnect_peer(&self, addr: &SocketAddr) {
-        if self.connected_peers.lock().await.remove(&addr).is_some() {
-            self.client.drop_peer().await;
-        }
+        self.connected_peers.lock().await.remove(&addr);
     }
 
     pub async fn peer(&self, addr: &SocketAddr) -> Option<IoRc<PeerConnection>> {
         self.connected_peers.lock().await.get(&addr).map(|(x, _)| x.clone())
+    }
+
+    pub async fn update_announce(&self, force: bool) -> anyhow::Result<()> {
+        let mut trackers = self.trackers.lock().await;
+        for x in trackers.iter_mut() {
+            for i in 0..x.len() {
+                if Instant::now().checked_duration_since(x[i].1).is_some() || force {
+                    select! {
+                        tracker_response = http_tracker(self, &x[i].0, self.client.config.request_peer_limit) => {
+                            let tracker_response: anyhow::Result<TrackerResponse> = tracker_response;
+                            match tracker_response {
+                                Ok(tracker_response) => match tracker_response {
+                                    TrackerResponse::Success {
+                                        interval,
+                                        peers,
+                                        warning: _,
+                                        min_interval: _,
+                                        tracker_id: _,
+                                        complete: _,
+                                        incomplete: _,
+                                        extra_fields: _,
+                                    } => {
+                                        let mut torrent_peers = self.peers.lock().await;
+                                        torrent_peers.clear();
+                                        for peer in peers.into_iter() {
+                                            torrent_peers.push_back(peer.addr);
+                                        }
+                                        debug!("received peers {:#?}", torrent_peers.deref());
+                                        x[i].1 = Instant::now() + Duration::from_secs(interval.as_u64());
+                                    },
+                                    TrackerResponse::Failure {
+                                        reason
+                                    } => {
+                                        info!("tracker {} query failed with reason: {}", x[i].0, reason);
+                                        continue;
+                                    }
+                                },
+                                Err(e) => {
+                                    info!("tracker {} query failed with error {:#?}", x[i].0, e);
+                                    continue;
+                                }
+                            }
+                        },
+                        _ = tokio::time::sleep(Duration::from_secs(20)) => {
+                            info!("tracker {} timed out", x[i].0);
+                            continue;
+                        }
+                    }
+                    (&mut trackers[..=i]).rotate_right(1);
+                    return Ok(());
+                } else {
+                    return Ok(());
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn downloaded(&self) -> u64 {
+        let bitfield = self.bitfield.read().await;
+        let mut bytes = bitfield.count_ones() as u64;
+        bytes *= self.piece_size as u64;
+        if bitfield.last().map(|x| x == &true).unwrap_or(false) {
+            bytes -= self.piece_size as u64;
+            bytes += self.last_piece_size as u64;
+        }
+        bytes
+    }
+
+    pub async fn needed(&self) -> u64 {
+        let bitfield = self.bitfield.read().await;
+        let mut bytes = bitfield.count_zeros() as u64;
+        bytes *= self.piece_size as u64;
+        if !bitfield.last().map(|x| x == &true).unwrap_or(false) {
+            bytes -= self.piece_size as u64;
+            bytes += self.last_piece_size as u64;
+        }
+        bytes
+    }
+
+    // pop peer before calling this
+    pub(crate) async fn try_connect_peer(self: &IoRc<Self>, perm: OwnedSemaphorePermit) -> anyhow::Result<bool> {
+        let peer = self.peers.lock().await.pop_front();
+        if peer.is_none() {
+            return Ok(false)
+        }
+        let peer = peer.unwrap();
+        println!("trying to connect {}", peer);
+        let connect: anyhow::Result<()> = select! {
+                    result = async {
+                        let sock = TcpStream::connect(peer).await?;
+                        self.connect_peer(peer, sock, None, perm).await?;
+                        anyhow::Result::<(), anyhow::Error>::Ok(())
+                    } => result,
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                        Err(anyhow::Error::msg("timeout"))
+                    }
+                };
+
+        if let Err(e) = connect {
+            self.disconnect_peer(&peer).await;
+            debug!("{peer} error while connecting to peer: {e:#?}");
+        }
+        Ok(true)
+    }
+
+    pub fn piece_count(&self) -> usize {
+        self.hashes.len()
+    }
+
+    pub async fn piece_done(&self) -> usize {
+        self.bitfield.read().await.count_ones()
     }
 }

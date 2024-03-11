@@ -1,39 +1,47 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use derive_more::{Deref, DerefMut};
+use itertools::Itertools;
 use log::{error, info, trace};
-use portable_atomic::AtomicU8;
+use portable_atomic::AtomicBool;
 use tokio::net::TcpListener;
 use tokio::select;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
+use tokio::time::{Instant, timeout, timeout_at};
 use crate::handshake::HandShake;
 use crate::torrent::{Torrent, TorrentHandle};
 use crate::types::*;
 pub struct Client {
+    pub external_addr: SocketAddr,
     pub peer_table: Mutex<HashMap<Hash20, Vec<SocketAddr>>>,
-    pub peer_left: AtomicU8,
-    peer_drop_notify: Notify,
+    pub peer_left: Arc<Semaphore>,
     pub server: TcpListener,
     torrents: Mutex<HashMap<Hash20, TorrentHandle>>,
     pub config: ClientConfig,
+    pub http_tracker_client: HttpClient,
+    force_announce: AtomicBool,
 }
-
 
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
+    pub port: u16,
     pub request_pacing_step_up: u16,
     pub request_pacing_step_down: u16,
     pub max_pending_per_peer: usize,
     pub max_peers: u8,
     pub data_path: Option<PathBuf>,
-    pub peer_id: Hash20
+    pub peer_id: Hash20,
+    pub upnp: Option<Ipv4Addr>,
+    pub request_peer_limit: usize,
 }
 
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
+            port: 10000,
             request_pacing_step_up: 500,
             request_pacing_step_down: 1,
             max_pending_per_peer: 32,
@@ -42,6 +50,8 @@ impl Default for ClientConfig {
             peer_id: Hash20 {
                 v: *b"hellothisissmolbittr"
             },
+            upnp: None,
+            request_peer_limit: 50,
         }
     }
 }
@@ -67,14 +77,16 @@ impl Drop for ClientHandle {
 
 impl Client {
 
-    pub async fn new(addr: SocketAddr, config: ClientConfig) -> anyhow::Result<ClientHandle> {
+    pub async fn new(addr: IpAddr, external_addr: SocketAddr, config: ClientConfig) -> anyhow::Result<ClientHandle> {
         let client = Client {
+            external_addr,
             peer_table: Default::default(),
-            peer_left: AtomicU8::new(config.max_peers),
-            peer_drop_notify: Default::default(),
-            server: TcpListener::bind(addr).await?,
+            peer_left: Arc::from(Semaphore::new(config.max_peers as usize)),
+            server: TcpListener::bind(SocketAddr::new(addr, config.port)).await?,
             torrents: Default::default(),
-            config
+            config,
+            http_tracker_client: Default::default(),
+            force_announce: Default::default(),
         };
         let handle = ClientHandle {
             client: IoRc::new(client),
@@ -132,8 +144,7 @@ impl Client {
             torrent_dir.push(&string_buf);
 
             fs::write(torrent_dir, file.clone().encode()?).await?;
-
-            string_buf.shrink_to(40);
+            let mut string_buf = file.info_hash();
             string_buf.push_str(PATH_POSTFIX);
             let mut path_dir = data_dir.clone();
             path_dir.push(&string_buf);
@@ -159,6 +170,8 @@ impl Client {
         select!(
             r = self.listen() => r,
             r = self.save_task() => r,
+            r = self.announce_task() => r,
+            r = self.disconnect_slow_task() => r,
         )
     }
 
@@ -166,30 +179,26 @@ impl Client {
     async fn listen(self: &IoRc<Self>) -> anyhow::Result<()> {
         trace!("listen called");
         loop {
-            if self.peer_left.load(Ordering::SeqCst) == 0 {
-                self.peer_drop_notify.notified().await;
-                continue;
-            }
-            trace!("waiting to accept");
             let (mut sock, addr) = self.server.accept().await?;
             info!("{addr} connecting...");
-            let client = self.clone();
-            self.peer_left.neg(Ordering::SeqCst);
-            spawn(async move { select! {
-                _ = async {
-                    let resuglt: anyhow::Result<()> = try {
-                        let handshake = HandShake::read_from(&mut sock).await?;
+            if let Ok(perm) = self.peer_left.clone().try_acquire_owned() {
+                let client = self.clone();
+                spawn(async move {
+                    let timeout = Instant::now() + Duration::from_secs(3);
+                    let result: anyhow::Result<()> = try {
+                        let handshake = timeout_at(timeout, HandShake::read_from(&mut sock)).await??;
                         info!("{addr} handshake received");
                         if let Some(torrent) = client.torrents.lock().await.get(&handshake.info_hash).map(|x| (*x).clone()) {
-                            torrent.connect_peer(addr, sock, Some(handshake)).await?;
+                            timeout_at(timeout, torrent.connect_peer(addr, sock, Some(handshake), perm)).await??;
                         } else {
                             info!("{addr} torrent not found, dropping connection");
                         }
                     };
-                    result.map_err(|x| error!("{addr} error while connecting: {x}")).ok();
-                } => {},
-                _ = tokio::time::sleep(Duration::from_secs(20)) => {client.drop_peer().await; /*timeout*/}
-            }});
+                    if let Err(e) = result {
+                        error!("{addr} error while connecting: {e}");
+                    }
+                });
+            }
         }
     }
 
@@ -214,8 +223,71 @@ impl Client {
         }
     }
 
-    pub(crate) async fn drop_peer(&self) {
-        self.peer_left.add(1, Ordering::SeqCst);
-        self.peer_drop_notify.notify_one();
+    async fn announce_task(&self) -> anyhow::Result<()> {
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        loop {
+            {
+                let force = self.force_announce.swap(false, Ordering::Relaxed);
+                let torrents = {
+                    let torrents = self.torrents.lock().await;
+                    torrents.iter().map(|(_, x)| (*x).clone()).collect_vec()
+                };
+                for x in torrents {
+                    x.update_announce(force).await?;
+                }
+            }
+            println!("peer_left: {}", self.peer_left.available_permits());
+            interval.tick().await;
+        }
+    }
+
+    async fn disconnect_slow_task(&self) -> anyhow::Result<()> {
+        loop {
+            if let Ok(mut perm) = self.peer_left.clone().try_acquire_owned() {
+                let torrents = self.torrents.lock().await.iter().map(|x| (*x.1).clone()).collect_vec();
+                let mut con = false;
+                for x in torrents.iter() {
+                    con |= x.try_connect_peer(perm).await?;
+                    if let Ok(perm2) = self.peer_left.clone().try_acquire_owned() {
+                        perm = perm2
+                    } else {
+                        break;
+                    }
+                }
+                if !con {
+                    //self.force_announce.store(true, Ordering::Relaxed);
+                } else {
+                    continue;
+                }
+            } else {
+                let torrents = {
+                    let torrents = self.torrents.lock().await;
+                    torrents.iter().map(|(_, x)| (*x).clone()).collect_vec()
+                };
+                for x in torrents {
+                    let mut slowest: Option<(SocketAddr, u32)> = None;
+                    let peers_lock = x.connected_peers.lock().await;
+                    for peer in peers_lock.iter() {
+                        let est_speed: u32 = peer.1.0.status.lock().await.download_speed.estimated_speed();
+                        if let Some(slowest) = slowest.as_mut() {
+                            if slowest.1 > dbg!(est_speed) {
+                                *slowest = (*peer.0, est_speed);
+                            }
+                        } else {
+                            slowest = Some((*peer.0, est_speed))
+                        }
+                    }
+                    if let Some(slowest) = slowest {
+                        if dbg!(peers_lock[&slowest.0].0.connected.elapsed() > Duration::from_secs(10)) {
+                            drop(peers_lock);
+                            x.disconnect_peer(&slowest.0).await;
+                            info!("{} disconnected due to inactive download", slowest.0);
+                            continue;
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
     }
 }

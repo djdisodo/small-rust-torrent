@@ -1,14 +1,12 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use log::{info, LevelFilter};
 use simplelog::{Config, ConfigBuilder, SimpleLogger};
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
-use tokio::join;
-use tokio::net::TcpListener;
 use tokio::task::LocalSet;
 use smolbt::client::{Client, ClientConfig};
 use smolbt::torrent::{Torrent, TorrentFile};
-use smolbt::types::Hash20;
 
 #[tokio::main(flavor = "current_thread")]
 pub async fn main() {
@@ -18,8 +16,13 @@ pub async fn main() {
     let mut data = Vec::new();
     bytes.read_to_end(&mut data).await.unwrap();
     let torrent = TorrentFile::read_from_bytes(&data).unwrap();
-    let cc = ClientConfig::default();
-    let mut client = Client::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 5555), cc).await.unwrap();
+    let mut cc = ClientConfig::default();
+    cc.port = 10000;
+    let mut client = Client::new(
+        IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(180,180,180,180)), 10001),
+        cc
+    ).await.unwrap();
     client.add_torrent(torrent, "./testaaa/".into()).await.unwrap();
     info!("added torrent");
     let localset = LocalSet::new();

@@ -17,12 +17,15 @@ mod handshake;
 mod bitfield;
 
 mod speed_estimator;
+
+mod tracker;
 pub mod types {
     //these are here for portability reasons
     pub use std::rc::Rc as IoRc;
 
     pub use std::collections::{HashMap, HashSet};
     use std::fmt::{Debug, Display, Formatter};
+    use std::io::Read;
     use std::rc::Rc;
 
     pub use tokio::fs as fs;
@@ -47,6 +50,8 @@ pub mod types {
 
     pub use crate::bitfield::*;
 
+    pub use reqwest::Client as HttpClient;
+
     pub type RcMutex<T> = Rc<Mutex<T>>;
 
     #[derive(Copy, Clone, Eq, PartialEq, Hash)]
@@ -69,6 +74,22 @@ pub mod types {
                 write!(f, "{x:02x}")?;
             }
             Ok(())
+        }
+    }
+
+    impl TryFrom<&[u8]> for Hash20 {
+        type Error = ();
+
+        fn try_from(mut value: &[u8]) -> Result<Self, Self::Error> {
+            if value.len() < 20 {
+                Err(())
+            } else {
+                let mut v = [0u8; 20];
+                std::io::Read::read(&mut value, &mut v).unwrap();
+                Ok(Self {
+                    v
+                })
+            }
         }
     }
 

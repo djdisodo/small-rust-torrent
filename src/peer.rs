@@ -12,6 +12,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::{join, select};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use crate::handshake::HandShake;
@@ -58,13 +59,15 @@ pub struct PeerConnection {
     pub request_channel: Sender<PieceRequest>,
     pub request_pacing: AtomicU16,
     pub peer_id: Hash20,
+    pub connected: Instant,
+    pub permit: OwnedSemaphorePermit,
 }
 
 
 pub struct PeerStatus {
     pub bitfield: BitField,
-    pub download_speed: SpeedEstimator<usize, 2>,
-    pub upload_speed: SpeedEstimator<u64, 4>
+    pub download_speed: SpeedEstimator<4>,
+    pub upload_speed: SpeedEstimator<4>
 }
 pub struct PeerConnectionRx {
     pub peer_connection: IoRc<PeerConnection>,
@@ -88,7 +91,7 @@ pub struct PeerConnectionTx {
 }
 
 impl PeerConnection {
-    pub async fn connect(addr: SocketAddr, torrent: IoRc<Torrent>, socket: TcpStream, incoming: Option<HandShake>) -> anyhow::Result<(IoRc<PeerConnection>, PeerConnectionTasks)> {
+    pub async fn connect(addr: SocketAddr, torrent: IoRc<Torrent>, socket: TcpStream, incoming: Option<HandShake>, permit: OwnedSemaphorePermit) -> anyhow::Result<(IoRc<PeerConnection>, PeerConnectionTasks)> {
         let (mut read, mut write) = socket.into_split();
         let (sender, receiver) = channel(torrent.client.config.max_pending_per_peer);
         let (internal_channel_send, internal_channel_recv) = channel(1);
@@ -123,6 +126,8 @@ impl PeerConnection {
             request_channel: piece_request_cannel_send,
             request_pacing: Default::default(),
             peer_id: handshake.peer_id,
+            connected: Instant::now(),
+            permit,
         });
 
         let mut upload = PeerConnectionTx {
@@ -156,7 +161,7 @@ impl PeerConnection {
             peer_connection: peer_connection.clone(),
             read,
             to_send: sender,
-            choked: false,
+            choked: true,
             verify_task: None,
             downloading_piece: None,
             last_block_receive: Instant::now(),
@@ -169,7 +174,7 @@ impl PeerConnection {
                     download.receive_message_retry().await?;
                 }
             };
-            info!("peer disconnected with: {:#?}", result);
+            info!("{:#?}({}) peer disconnected with: {:#?}", download.peer_connection.addr, download.peer_connection.peer_id, result);
             if let Err(e) = result {
                 info!("{:#?}", e.backtrace())
             }
@@ -258,6 +263,7 @@ impl PeerConnectionRx {
     }
 
     async fn set_piece(&mut self, idx: u32) {
+        self.peer_connection.internal_channel.send(InternalMessage::Interested).await.ok();
         let files = self.peer_connection.torrent.new_piece(idx).unwrap();
         let piece_writer = PieceWriter::new(files, &self.peer_connection.torrent);
         self.downloading_piece = Some((idx, piece_writer, 0));
@@ -354,6 +360,8 @@ impl PeerConnectionRx {
         let length = *to_read as u32;
         if self.downloading_piece.as_ref().map(|p| p.0) == Some(piece_idx) {
             let full = self.downloading_piece.as_mut().unwrap().1.write_block(&self.peer_connection.torrent, begin, &mut self.read, length).await?;
+            self.peer_connection.status.lock().await.download_speed.update(length);
+            self.peer_connection.torrent.down_speed.lock().await.update(length);
             if full {
                 if let Some(t) = self.verify_task.take() {
                     t.await?; //wait till last verification finish
@@ -376,16 +384,18 @@ impl PeerConnectionRx {
                 }
 
                 let joinhandle = spawn(async move { let result: anyhow::Result<()> = try {
-                    println!("try verification");
                     if piece.1.hash(&peer.torrent).await? == peer.torrent.hashes[piece.0 as usize] {
-                        peer.status.lock().await.download_speed.update(1);
                         peer.torrent.bitfield.write().await.set(piece.0 as usize, true);
                         peer.torrent.have(piece.0).await;
+                        info!("{:#?}({}) piece idx: {} verification success", peer.addr, peer.peer_id, piece.0);
                     } else {
                         //unlikely to happen
-                        //queue for redownload
-                        println!("verification failed");
+                        //queue for redownload and disconnect
                         peer.torrent.to_download_bitfield.write().await.set(piece.0 as usize, false);
+                        let addr = peer.addr;
+                        error!("{:#?}({}) disconnecting because received bad piece", addr, peer.peer_id);
+                        //TODO better handling
+                        peer.torrent.disconnect_peer(&addr).await;
                     }
                 }; result.map_err(|e| {
                     error!("Error while piece verification {e:#?}");
@@ -447,7 +457,7 @@ impl PeerConnectionRx {
                 r?;
                 let mut to_read = self.read.read_u32().await? as usize;
                 if to_read == 0 { // keep-alive
-                    info!("received keep-alive");
+                    trace!("{:#?}({}) received keep-alive", self.peer_connection.addr, self.peer_connection.peer_id);
                     return Ok(());
                 }
                 to_read -= 1;
@@ -575,7 +585,8 @@ impl PeerConnectionTx {
             self.write.write_u32(block.begin).await?;
             let read = piece_cached.read(&*self.peer_connection.torrent, block.begin, block.len.get(), &mut self.write).await?;
             ensure!(block.len.get() == read as u32, "unknown error while transmitting piece");
-            self.peer_connection.status.lock().await.upload_speed.update(len as u64);
+            self.peer_connection.status.lock().await.upload_speed.update(len);
+            self.peer_connection.torrent.uploaded.add(len as u64, Ordering::SeqCst);
         } else {
             bail!("request out of range");
         }
